@@ -1,0 +1,6 @@
+{
+  "name": "Namma Stores",
+  "description": "Namma Stores is coming to Whitefield. Join Early Access for launch updates on fresh meat, fruits & vegetables, and puja essentials from local stores.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
