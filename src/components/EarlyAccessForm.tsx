@@ -143,12 +143,14 @@ export const EarlyAccessForm: React.FC<EarlyAccessFormProps> = ({
     try {
       const result = await submitEarlyAccessLead(formData, attribution);
 
-      if (result.success) {
-        setIsDuplicate(Boolean(result.duplicate));
-        setIsMockSubmission(Boolean(result.isMock));
-        setSubmittedLeadId(result.leadId || null);
-        setIsCompleted(true);
-      } else {
+   if (result.success) {
+   (window as any).fbq?.('track', 'Lead');
+
+    setIsDuplicate(Boolean(result.duplicate));
+    setIsMockSubmission(Boolean(result.isMock));
+    setSubmittedLeadId(result.leadId || null);
+    setIsCompleted(true);
+    } else {
         setServerError(result.message || 'Something went wrong. Please try again.');
       }
     } catch {
