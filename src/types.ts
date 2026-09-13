@@ -1,4 +1,4 @@
-export type ShoppingPreference = 
+export type ShoppingPreference =
   | 'Fresh Meat'
   | 'Fruits & Vegetables'
   | 'Puja Essentials'
@@ -71,7 +71,6 @@ export interface RpcSubmitLeadResult {
   duplicate?: boolean;
   message?: string;
 }
-
 
 export type StoreCategory =
   | 'Grocery Store'
