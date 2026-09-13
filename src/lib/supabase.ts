@@ -1,19 +1,19 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-// Retrieve public/publishable credentials from Vite environment
+// Vite injects these public client credentials at build time.
+// Never use a Supabase service-role key in browser code.
 const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
 const supabaseAnonKey = (
-  import.meta.env.VITE_SUPABASE_ANON_KEY || 
-  import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || 
+  import.meta.env.VITE_SUPABASE_ANON_KEY ||
+  import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
   ''
 ).trim();
 
-// Ensure both URL and public anon key are present and formatted correctly
 export const isSupabaseConfigured = Boolean(
   supabaseUrl &&
-  supabaseAnonKey &&
-  supabaseUrl.startsWith('https://') &&
-  supabaseAnonKey.length > 20
+    supabaseAnonKey &&
+    /^https:\/\/[^\s/]+\.supabase\.co(?:\/)?$/i.test(supabaseUrl) &&
+    supabaseAnonKey.length > 20,
 );
 
 let client: SupabaseClient | null = null;
@@ -25,6 +25,10 @@ if (isSupabaseConfigured) {
         persistSession: false,
         autoRefreshToken: false,
       },
+      db: {
+        // Keep the SDK's built-in PostgREST retry behavior enabled for transient failures.
+        retry: true,
+      },
     });
   } catch (err) {
     console.error('Failed to initialize Supabase client:', err);
@@ -32,8 +36,8 @@ if (isSupabaseConfigured) {
   }
 } else if (import.meta.env.DEV) {
   console.warn(
-    '⚠️ [Namma Stores] Supabase credentials not found in environment. ' +
-    'Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local for live database integration.'
+    '⚠️ [Namma Stores] Supabase credentials not found or invalid. ' +
+      'Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local for live database integration.',
   );
 }
 
