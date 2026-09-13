@@ -1,15 +1,47 @@
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
-import { 
-  LeadFormData, 
-  AttributionData, 
-  SubmissionResponse, 
+import {
+  LeadFormData,
+  AttributionData,
+  SubmissionResponse,
   EarlyAccessLeadRecord,
-  RpcSubmitLeadResult 
+  RpcSubmitLeadResult,
 } from '../types';
-import { validateIndianMobile, validateName, validateArea, validateEmailOptional } from '../lib/validation';
+import {
+  validateIndianMobile,
+  validateName,
+  validateArea,
+  validateEmailOptional,
+} from '../lib/validation';
 import { trackEvent } from '../lib/analytics';
 
 const LOCAL_STORAGE_LEADS_KEY = 'namma_stores_leads_offline_v2';
+const MAX_RPC_ATTEMPTS = 3;
+const RETRY_DELAYS_MS = [350, 900];
+
+function isRetryableRpcError(error: { code?: string; message?: string; status?: number } | null): boolean {
+  if (!error) return false;
+
+  const status = Number(error.status || 0);
+  const code = String(error.code || '').toUpperCase();
+  const message = String(error.message || '').toLowerCase();
+
+  if ([408, 409, 429, 500, 502, 503, 504, 520, 522, 524].includes(status)) return true;
+  if (['PGRST003', 'PGRST004'].includes(code)) return true;
+
+  return (
+    message.includes('network') ||
+    message.includes('fetch') ||
+    message.includes('failed to fetch') ||
+    message.includes('timeout') ||
+    message.includes('timed out') ||
+    message.includes('temporarily unavailable') ||
+    message.includes('connection')
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * Dedicated service layer for Early Access lead management.
@@ -17,33 +49,32 @@ const LOCAL_STORAGE_LEADS_KEY = 'namma_stores_leads_offline_v2';
  */
 export async function submitEarlyAccessLead(
   formData: LeadFormData,
-  attribution: AttributionData
+  attribution: AttributionData,
 ): Promise<SubmissionResponse> {
-  // 1. Frontend validation (UX gatekeeper)
   const nameVal = validateName(formData.name);
   if (!nameVal.isValid) {
-    return { 
-      success: false, 
-      statusType: 'validation_error', 
-      message: nameVal.errorMessage || 'Invalid name' 
+    return {
+      success: false,
+      statusType: 'validation_error',
+      message: nameVal.errorMessage || 'Invalid name',
     };
   }
 
   const phoneVal = validateIndianMobile(formData.phone);
   if (!phoneVal.isValid) {
-    return { 
-      success: false, 
-      statusType: 'validation_error', 
-      message: phoneVal.errorMessage || 'Invalid mobile number' 
+    return {
+      success: false,
+      statusType: 'validation_error',
+      message: phoneVal.errorMessage || 'Invalid mobile number',
     };
   }
 
   const areaVal = validateArea(formData.area);
   if (!areaVal.isValid) {
-    return { 
-      success: false, 
-      statusType: 'validation_error', 
-      message: areaVal.errorMessage || 'Invalid area' 
+    return {
+      success: false,
+      statusType: 'validation_error',
+      message: areaVal.errorMessage || 'Invalid area',
     };
   }
 
@@ -58,40 +89,114 @@ export async function submitEarlyAccessLead(
     }
   }
 
-  // 2. Normalize shopping preferences into text[] array
   let shoppingPreferencesArray: string[] = [];
   if (Array.isArray(formData.shoppingPreference)) {
     shoppingPreferencesArray = formData.shoppingPreference
       .map((p) => String(p).trim())
       .filter(Boolean);
-  } else if (typeof formData.shoppingPreference === 'string' && formData.shoppingPreference.trim() !== '') {
+  } else if (
+    typeof formData.shoppingPreference === 'string' &&
+    formData.shoppingPreference.trim() !== ''
+  ) {
     shoppingPreferencesArray = [formData.shoppingPreference.trim()];
   }
 
-  // 3. Authoritative Production Path: Supabase RPC public.submit_early_access_lead
   if (isSupabaseConfigured && supabase) {
-    try {
-      const rpcParams = {
-        p_name: nameVal.cleaned,
-        p_phone: phoneVal.cleanDigits,
-        p_area: areaVal.cleaned,
-        p_shopping_preferences: shoppingPreferencesArray,
-        p_utm_source: attribution.utm_source || null,
-        p_utm_medium: attribution.utm_medium || null,
-        p_utm_campaign: attribution.utm_campaign || null,
-        p_utm_content: attribution.utm_content || null,
-        p_utm_term: attribution.utm_term || null,
-        p_whatsapp_consent: Boolean(formData.whatsappConsent),
-        p_email: formData.email?.trim() || null,
-      };
+    const rpcParams = {
+      p_name: nameVal.cleaned,
+      p_phone: phoneVal.cleanDigits,
+      p_area: areaVal.cleaned,
+      p_shopping_preferences: shoppingPreferencesArray,
+      p_utm_source: attribution.utm_source || null,
+      p_utm_medium: attribution.utm_medium || null,
+      p_utm_campaign: attribution.utm_campaign || null,
+      p_utm_content: attribution.utm_content || null,
+      p_utm_term: attribution.utm_term || null,
+      p_utm_id: attribution.utm_id || null,
+      p_adset_id: attribution.adset_id || null,
+      p_ad_id: attribution.ad_id || null,
+      p_placement: attribution.placement || null,
+      p_whatsapp_consent: Boolean(formData.whatsappConsent),
+      p_email: formData.email?.trim() || null,
+    };
 
-      const { data, error } = await supabase.rpc('submit_early_access_lead', rpcParams);
+    let lastError: { code?: string; message?: string; details?: string; hint?: string; status?: number } | null = null;
 
-      if (error) {
+    for (let attempt = 1; attempt <= MAX_RPC_ATTEMPTS; attempt += 1) {
+      try {
+        const { data, error } = await supabase.rpc('submit_early_access_lead', rpcParams);
+
+        if (!error) {
+          if (data && typeof data === 'object') {
+            const resObj = data as RpcSubmitLeadResult;
+            const isDuplicateLead = Boolean(
+              resObj.duplicate === true || resObj.status === 'duplicate',
+            );
+            const extractedLeadId = resObj.id ? String(resObj.id) : null;
+
+            if (isDuplicateLead) {
+              trackEvent('lead_created', { status: 'duplicate', area: areaVal.cleaned });
+              return {
+                success: true,
+                duplicate: true,
+                statusType: 'duplicate',
+                isMock: false,
+                leadId: extractedLeadId,
+                message:
+                  resObj.message ||
+                  "You're already on the Namma Stores early-access list. 💚",
+                phone: phoneVal.cleanDigits,
+                name: nameVal.cleaned,
+              };
+            }
+
+            trackEvent('lead_created', {
+              status: 'new',
+              area: areaVal.cleaned,
+              has_preference: shoppingPreferencesArray.length > 0,
+            });
+
+            return {
+              success: true,
+              duplicate: false,
+              statusType: 'real_success',
+              isMock: false,
+              leadId: extractedLeadId,
+              message: resObj.message || "You're on the list! 🎉",
+              phone: phoneVal.cleanDigits,
+              name: nameVal.cleaned,
+            };
+          }
+
+          const returnedId = typeof data === 'string' ? data : null;
+          trackEvent('lead_created', {
+            status: 'new',
+            area: areaVal.cleaned,
+            has_preference: shoppingPreferencesArray.length > 0,
+          });
+
+          return {
+            success: true,
+            duplicate: false,
+            statusType: 'real_success',
+            isMock: false,
+            leadId: returnedId,
+            message: "You're on the list! 🎉",
+            phone: phoneVal.cleanDigits,
+            name: nameVal.cleaned,
+          };
+        }
+
+        lastError = {
+          code: error.code,
+          message: error.message,
+          details: error.details,
+          hint: error.hint,
+        };
+
         const errorMsg = error.message?.toLowerCase() || '';
         const errorCode = error.code || '';
 
-        // Handle unique constraint / duplicate phone detection from PostgreSQL
         if (
           errorCode === '23505' ||
           errorMsg.includes('duplicate') ||
@@ -110,107 +215,52 @@ export async function submitEarlyAccessLead(
           };
         }
 
-        console.error('Supabase submit_early_access_lead RPC error:', {
-          code: errorCode,
-          message: error.message,
-          details: error.details,
-          hint: error.hint,
-        });
-        trackEvent('lead_created', { status: 'failure', reason: error.message });
-
-        return {
-          success: false,
-          statusType: 'database_failure',
-          message: 'Unable to complete registration. Please try again in a moment or join our WhatsApp community.',
-        };
-      }
-
-      // Check if RPC returned a structured response payload (JSON / JSONB)
-      if (data && typeof data === 'object') {
-        const resObj = data as RpcSubmitLeadResult;
-        const isDuplicateLead = Boolean(resObj.duplicate === true || resObj.status === 'duplicate');
-        const extractedLeadId = resObj.id ? String(resObj.id) : null;
-
-        if (isDuplicateLead) {
-          trackEvent('lead_created', { status: 'duplicate', area: areaVal.cleaned });
-          return {
-            success: true,
-            duplicate: true,
-            statusType: 'duplicate',
-            isMock: false,
-            leadId: extractedLeadId,
-            message: resObj.message || "You're already on the Namma Stores early-access list. 💚",
-            phone: phoneVal.cleanDigits,
-            name: nameVal.cleaned,
-          };
+        if (!isRetryableRpcError(error) || attempt === MAX_RPC_ATTEMPTS) {
+          break;
         }
 
-        trackEvent('lead_created', {
-          status: 'new',
-          area: areaVal.cleaned,
-          has_preference: shoppingPreferencesArray.length > 0,
-        });
-
-        return {
-          success: true,
-          duplicate: false,
-          statusType: 'real_success',
-          isMock: false,
-          leadId: extractedLeadId,
-          message: resObj.message || "You're on the list! 🎉",
-          phone: phoneVal.cleanDigits,
-          name: nameVal.cleaned,
+        await sleep(RETRY_DELAYS_MS[attempt - 1] ?? 1000);
+      } catch (networkOrExecErr) {
+        lastError = {
+          message: networkOrExecErr instanceof Error ? networkOrExecErr.message : String(networkOrExecErr),
         };
+
+        if (attempt === MAX_RPC_ATTEMPTS) break;
+        await sleep(RETRY_DELAYS_MS[attempt - 1] ?? 1000);
       }
-
-      // Handle legacy scalar responses (e.g. returns boolean true or lead ID string)
-      let returnedId: string | null = null;
-      if (typeof data === 'string') {
-        returnedId = data;
-      }
-
-      trackEvent('lead_created', {
-        status: 'new',
-        area: areaVal.cleaned,
-        has_preference: shoppingPreferencesArray.length > 0,
-      });
-
-      return {
-        success: true,
-        duplicate: false,
-        statusType: 'real_success',
-        isMock: false,
-        leadId: returnedId,
-        message: "You're on the list! 🎉",
-        phone: phoneVal.cleanDigits,
-        name: nameVal.cleaned,
-      };
-    } catch (networkOrExecErr) {
-      console.error('Supabase submit_early_access_lead network or connection exception:', networkOrExecErr);
-      trackEvent('lead_created', { status: 'failure', reason: 'network_exception' });
-      return {
-        success: false,
-        statusType: 'network_error',
-        message: 'Unable to connect to registration service. Please check your internet connection and retry.',
-      };
     }
-  }
 
-  // 4. Production Guard: In production, NEVER execute fake success or localStorage fallback
-  if (import.meta.env.PROD) {
-    console.error(
-      '⚠️ [Namma Stores Production Error] VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY is not configured in this environment. ' +
-      'Please ensure these build-time environment variables are configured in Cloudflare before deploying.'
-    );
-    trackEvent('lead_created', { status: 'failure', reason: 'unconfigured_production_environment' });
+    console.error('Supabase submit_early_access_lead RPC failure after retries:', lastError);
+    trackEvent('lead_created', {
+      status: 'failure',
+      reason: lastError?.message || 'rpc_failure',
+    });
+
     return {
       success: false,
-      statusType: 'unconfigured',
-      message: 'Registration service is currently undergoing final configuration. Please join our WhatsApp community directly to reserve your early spot.',
+      statusType: isRetryableRpcError(lastError) ? 'network_error' : 'database_failure',
+      message: isRetryableRpcError(lastError)
+        ? 'We could not connect right now. Please try again in a moment.'
+        : 'Unable to complete registration. Please try again in a moment or join our WhatsApp community.',
     };
   }
 
-  // 5. Local Development Fallback: ONLY executed when in DEV mode AND Supabase is NOT configured
+  if (import.meta.env.PROD) {
+    console.error(
+      '⚠️ [Namma Stores Production Error] VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY is not configured in this environment.',
+    );
+    trackEvent('lead_created', {
+      status: 'failure',
+      reason: 'unconfigured_production_environment',
+    });
+    return {
+      success: false,
+      statusType: 'unconfigured',
+      message:
+        'Registration service is currently undergoing final configuration. Please join our WhatsApp community directly to reserve your early spot.',
+    };
+  }
+
   if (import.meta.env.DEV && !isSupabaseConfigured) {
     return saveLeadLocalFallback(
       formData,
@@ -218,7 +268,7 @@ export async function submitEarlyAccessLead(
       phoneVal.cleanDigits,
       areaVal.cleaned,
       shoppingPreferencesArray,
-      attribution
+      attribution,
     );
   }
 
@@ -229,16 +279,13 @@ export async function submitEarlyAccessLead(
   };
 }
 
-/**
- * Local development fallback storage helper for customer leads.
- */
 function saveLeadLocalFallback(
   formData: LeadFormData,
   nameCleaned: string,
   phoneCleanDigits: string,
   areaCleaned: string,
   shoppingPreferencesArray: string[],
-  attribution: AttributionData
+  attribution: AttributionData,
 ): SubmissionResponse {
   try {
     const rawExisting = localStorage.getItem(LOCAL_STORAGE_LEADS_KEY);
@@ -281,10 +328,7 @@ function saveLeadLocalFallback(
     existing.push(devRecord);
     localStorage.setItem(LOCAL_STORAGE_LEADS_KEY, JSON.stringify(existing));
 
-    console.info(
-      'ℹ️ [Namma Stores Local Dev Preview] Stored lead in browser storage:',
-      devRecord
-    );
+    console.info('ℹ️ [Namma Stores Local Dev Preview] Stored lead in browser storage:', devRecord);
 
     trackEvent('lead_created', { status: 'new_local_preview', area: areaCleaned });
 
@@ -308,10 +352,6 @@ function saveLeadLocalFallback(
   }
 }
 
-/**
- * Updates `whatsapp_cta_clicked` flag safely without reading or exposing lead records.
- * Non-blocking: tracking failures never prevent user interaction.
- */
 export async function markWhatsAppCtaClicked(leadId?: string | null): Promise<void> {
   trackEvent('whatsapp_cta_clicked', { has_lead: Boolean(leadId) });
 
@@ -331,17 +371,15 @@ export async function markWhatsAppCtaClicked(leadId?: string | null): Promise<vo
       }
     }
   } else if (!import.meta.env.PROD && !isSupabaseConfigured && cleanedLeadId) {
-    // Local dev mock update only when Supabase is not configured
     try {
       const rawExisting = localStorage.getItem(LOCAL_STORAGE_LEADS_KEY);
       if (rawExisting) {
         const existing: EarlyAccessLeadRecord[] = JSON.parse(rawExisting);
-        const updated = existing.map((lead) => {
-          if (lead.id === cleanedLeadId) {
-            return { ...lead, whatsapp_cta_clicked: true, updated_at: new Date().toISOString() };
-          }
-          return lead;
-        });
+        const updated = existing.map((lead) =>
+          lead.id === cleanedLeadId
+            ? { ...lead, whatsapp_cta_clicked: true, updated_at: new Date().toISOString() }
+            : lead,
+        );
         localStorage.setItem(LOCAL_STORAGE_LEADS_KEY, JSON.stringify(updated));
       }
     } catch {
